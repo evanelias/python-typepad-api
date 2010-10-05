@@ -1,8 +1,10 @@
 #!/usr/bin/env python
+from __future__ import with_statement
+
 
 import codecs
 from cStringIO import StringIO
-import json
+import simplejson as json
 import logging
 from os.path import join
 import re
@@ -406,12 +408,10 @@ class Field(lazy):
         self.kwargs = dict()
         super(Field, self).__init__(data)
 
-    @property
-    def type(self):
+    def get_type(self):
         return self.__dict__['type']
 
-    @type.setter
-    def type(self, val):
+    def set_type(self, val):
         self.__dict__['type'] = val
 
         mo = re.match(r'(\w+)<([^>]+)>', val)
@@ -439,6 +439,8 @@ class Field(lazy):
             if val == 'Base':
                 val = 'TypePadObject'
             self.args.append(val)
+
+    type = property(get_type, set_type)
 
     @property
     def docstring_type(self):
@@ -478,12 +480,10 @@ class Field(lazy):
 
 class ObjectRef(Field):
 
-    @property
-    def type(self):
+    def get_type(self):
         return self.__dict__['type']
 
-    @type.setter
-    def type(self, val):
+    def set_type(self, val):
         self.__dict__['type'] = val
 
         mo = re.match(r'(\w+)<([^>]+)>', val)
@@ -498,6 +498,8 @@ class ObjectRef(Field):
             raise ValueError('Unknown container type %r' % container)
 
         self.field_type = val
+
+    type = property(get_type, set_type)
 
     @property
     def docstring_type(self):
@@ -543,28 +545,28 @@ class Property(lazy):
         self.field = Field()
         super(Property, self).__init__(data)
 
-    @property
-    def name(self):
+    def get_name(self):
         return self.__dict__['name']
 
-    @name.setter
-    def name(self, name):
+    def set_name(self, name):
         py_name = name_to_pyname(name)
         if py_name != name:
             self.field.kwargs['api_name'] = name
         self.__dict__['name'] = py_name
 
-    @property
-    def type(self):
+    name = property(get_name, set_name)
+
+    def get_type(self):
         try:
             return self.__dict__['type']
         except KeyError:
             raise AttributeError('type')
 
-    @type.setter
-    def type(self, val):
+    def set_type(self, val):
         self.__dict__['type'] = val
         self.field.type = val
+
+    type = property(get_type, set_type)
 
     def render_docstring(self):
         val = self.docString
@@ -614,6 +616,23 @@ class Property(lazy):
         val = '\n'.join(lines)
         return val
 
+    def set_path(self, chunks=[], params={}):
+        """
+        Receives the pathChunks and pathParams values for a property or endpoint, and builds an api_url kwarg with
+        Python format specifiers in place of variables.  
+        Also un-sets api_name kwarg, since properties/endpoints using api_url should not use api_name.
+        """
+        for param, position in params.items():
+            chunks[position] = '%%(%s)s' % name_to_pyname(param)
+            if param != 'id':
+                self.field.kwargs['is_callable'] = True
+        self.field.kwargs['api_url'] = '/' + '/'.join(chunks) + '.json'
+        
+        try:
+            del self.field.kwargs['api_name']
+        except KeyError:
+            pass
+
     def __str__(self):
         me = StringIO()
         me.write(self.name)
@@ -631,29 +650,29 @@ class ActionEndpoint(Property):
         super(ActionEndpoint, self).__init__(data)
         self.field.field_type = 'fields.ActionEndpoint'
 
-    @property
-    def postType(self):
+    def get_post_type(self):
         return self.__dict__['postType']
 
-    @postType.setter
-    def postType(self, val):
+    def set_post_type(self, val):
         cls_name = '_%sPost' % pyname_to_classname(self.name)
         self.field.kwargs['post_type'] = ClassRef({'type': cls_name})
 
         post_type = ObjectType({'name': cls_name, 'properties': val, 'parentType': 'TypePadObject', 'squashed': True})
         self.__dict__['postType'] = post_type
 
-    @property
-    def responseType(self):
+    postType = property(get_post_type, set_post_type)
+
+    def get_response_type(self):
         return self.__dict__['responseType']
 
-    @responseType.setter
-    def responseType(self, val):
+    def set_response_type(self, val):
         cls_name = '_%sResponse' % pyname_to_classname(self.name)
         self.field.kwargs['response_type'] = ClassRef({'type': cls_name})
 
         resp_type = ObjectType({'name': cls_name, 'properties': val, 'parentType': 'TypePadObject', 'squashed': True})
         self.__dict__['responseType'] = resp_type
+
+    responseType = property(get_response_type, set_response_type)
 
     def __str__(self):
         me = StringIO()
@@ -669,26 +688,54 @@ class ActionEndpoint(Property):
         return me.getvalue()
 
 
+class ItemEndpoint(Property):
+    def __str__(self):
+        me = StringIO()
+        me.write("""
+    def make_self_link(self):
+        return urljoin(typepad.client.endpoint, '%(api_url)s' %% {'id': self.url_id})
+
+    @property
+    def xid(self):
+        return self.url_id
+
+    @classmethod
+    def get_by_id(cls, id, **kwargs):
+        url_id = id.rsplit(':', 1)[-1]
+        return cls.get_by_url_id(url_id, **kwargs)
+
+    @classmethod
+    def get_by_url_id(cls, url_id, **kwargs):
+        if url_id == '':
+            raise ValueError("An url_id is required")
+        obj = cls.get('%(api_url)s' %% {'id': url_id}, **kwargs)
+        obj.__dict__['url_id'] = url_id
+        obj.__dict__['id'] = 'tag:api.typepad.com,2009:%%s' %% url_id
+        return obj
+
+        """.lstrip('\n') % {'api_url': self.field.kwargs['api_url']})
+        me.write('\n')
+        return me.getvalue()
+
+
 class ObjectType(lazy):
 
     types_by_name = dict()
 
-    @property
-    def name(self):
+    def get_name(self):
         return self.__dict__['name']
 
-    @name.setter
-    def name(self, val):
+    def set_name(self, val):
         assert 'name' not in self.__dict__
         self.__dict__['name'] = val
         self.types_by_name[val] = self
 
-    @property
-    def properties(self):
+    name = property(get_name, set_name)
+
+    def get_properties(self):
         return self.__dict__['properties']
 
-    @properties.setter
-    def properties(self, val):
+    def set_properties(self, val):
         # Keep a clean copy safe for referring to later.
         self.__dict__['property_data'] = dict((prop['name'], dict(prop)) for prop in val)
         # Now make val a dict for working with now.
@@ -721,6 +768,8 @@ class ObjectType(lazy):
         props = dict((prop.name, prop) for prop in props)
         self.__dict__['properties'] = props
 
+    properties = property(get_properties, set_properties)
+
     @property
     def parents(self):
         parents = [self.parentType]
@@ -736,8 +785,7 @@ class ObjectType(lazy):
             return False
         return self.types_by_name[self.parentType].has_get_by_url_id
 
-    @property
-    def docString(self):
+    def get_doc_string(self):
         try:
             return self.__dict__['docString']
         except KeyError:
@@ -748,9 +796,10 @@ class ObjectType(lazy):
         except KeyError:
             raise AttributeError('docString')
 
-    @docString.setter
-    def docString(self, val):
+    def set_doc_string(self, val):
         self.__dict__['docString'] = val
+
+    docString = property(get_doc_string, set_doc_string)
 
     @property
     def synopsis(self):
@@ -760,38 +809,44 @@ class ObjectType(lazy):
         logging.debug('    First line of that docstring is %r', first_line)
         return first_line.rstrip('.')
 
-    @property
-    def endpoint(self):
-        return self.__dict__['endpoint']
+    def get_endpoints(self):
+        try:
+            return self.__dict__['endpoints']
+        except KeyError:
+            return {}
 
-    @endpoint.setter
-    def endpoint(self, val):
-        self.__dict__['endpoint'] = val
-        self.endpoint_name = val['name']
+    def set_endpoints(self, val):
+        self.__dict__['endpoints'] = dict()
+        for endpoint in val:
+            endp_types = {
+                'SubResource': self.add_property_endpoint,
+                'Action': self.add_action_endpoint,
+                'Item': self.add_item_endpoint,
+                # TODO: implement bare noun endpoints
+                'BareNoun': lambda x: None,
+            }
+            endp_typename = endpoint['endpointType']
+            try:
+                add_endpoint = endp_types[endp_typename]
+            except KeyError:
+                raise ValueError('Unknown endpoint type %r for %s endpoint named %r' % (endp_typename, self.name, endpoint.get('name')))
 
-        assert 'properties' in self.__dict__
-        logging.debug('Object %s has properties %r', self.name, self.__dict__['properties'].keys())
+            add_endpoint(endpoint)
 
-        for endp in val['propertyEndpoints']:
-            self.add_property_endpoint(endp)
-
-        for endp in val['actionEndpoints']:
-            self.add_action_endpoint(endp)
+    endpoints = property(get_endpoints, set_endpoints)
 
     def add_action_endpoint(self, endp):
         name = endp['name']
 
-        try:
-            endpoints = self.action_endpoints
-        except AttributeError:
-            endpoints = self.action_endpoints = {}
-
         endp_obj = ActionEndpoint({'name': name})
-        endp_obj.postType = endp['postObjectType']['properties']
-        if 'responseObjectType' in endp:
-            endp_obj.responseType = endp['responseObjectType']['properties']
+        endp_obj.postType = endp['requestObjectType']['properties']
+        endp_obj.set_path(chunks=endp["pathChunks"], params=endp["pathParams"])
 
-        endpoints[endp_obj.name] = endp_obj
+        resp_type = endp.get('responseObjectType')
+        if resp_type:
+            endp_obj.responseType = resp_type['properties']
+
+        self.endpoints[endp_obj.name] = endp_obj
 
     def add_property_endpoint(self, endp):
         name = endp['name']
@@ -800,7 +855,7 @@ class ObjectType(lazy):
             value_type = LINK_PROPERTY_FIXUPS[self.name][name]['type']
         except KeyError:
             try:
-                value_type = endp['resourceObjectType']['name']
+                value_type = endp['resourceObjectType']
             except KeyError:
                 logging.info('Skipping endpoint %s.%s since it has no resourceObjectType', self.endpoint_name, name)
                 return
@@ -826,12 +881,17 @@ class ObjectType(lazy):
                     "named that (%r)" % (prop.name, self.name, str(self.properties[prop.name])))
 
             logging.info("Used property name override to rename %s.%s as %r", self.name, endp['name'], name)
-            if 'api_name' not in prop.field.kwargs:
-                prop.field.kwargs['api_name'] = prop.name
             prop.name = new_name
+
+        prop.set_path(chunks=endp["pathChunks"], params=endp["pathParams"])
 
         logging.debug('Adding Link property %s.%s', self.name, prop.name)
         self.properties[prop.name] = prop
+
+    def add_item_endpoint(self, endp):
+        item_endp = ItemEndpoint({})
+        item_endp.set_path(chunks=endp["pathChunks"], params=endp["pathParams"])
+        self.item_endpoint = item_endp
 
     def __repr__(self):
         return "<%s %s>" % (type(self).__name__, self.name)
@@ -854,37 +914,15 @@ class ObjectType(lazy):
         if self.properties:
             me.write('\n')
 
-        action_endpoints = getattr(self, 'action_endpoints', {})
-        for name, endpoint in sorted(action_endpoints.items(), key=lambda x: x[0]):
+        endpoints = getattr(self, 'endpoints', {})
+        for name, endpoint in sorted(endpoints.items(), key=lambda x: x[0]):
             endp_text = str(endpoint)
             endp_text = indent(endp_text)
             endp_text = endp_text.rstrip('\n') + '\n\n'
             me.write(endp_text)
 
-        if hasattr(self, 'endpoint_name') and self.has_get_by_url_id:
-            me.write("""
-    def make_self_link(self):
-        return urljoin(typepad.client.endpoint, '/%(endpoint_name)s/%%s.json' %% self.url_id)
-
-    @property
-    def xid(self):
-        return self.url_id
-
-    @classmethod
-    def get_by_id(cls, id, **kwargs):
-        url_id = id.rsplit(':', 1)[-1]
-        return cls.get_by_url_id(url_id, **kwargs)
-
-    @classmethod
-    def get_by_url_id(cls, url_id, **kwargs):
-        if url_id == '':
-            raise ValueError("An url_id is required")
-        obj = cls.get('/%(endpoint_name)s/%%s.json' %% url_id, **kwargs)
-        obj.__dict__['url_id'] = url_id
-        obj.__dict__['id'] = 'tag:api.typepad.com,2009:%%s' %% url_id
-        return obj
-
-""".lstrip('\n') % {'endpoint_name': self.endpoint_name})
+        if hasattr(self, 'item_endpoint') and self.has_get_by_url_id:
+            me.write(str(self.item_endpoint))
 
         if self.name in CLASS_EXTRAS:
             me.write(CLASS_EXTRAS[self.name].lstrip('\n'))
@@ -898,18 +936,18 @@ class ObjectType(lazy):
             body, '' if squash else '\n')
 
 
-def generate_types(types_fn=None, nouns_fn=None):
+def generate_types(types_fn=None, resourcemap_fn=None):
     if types_fn is None:
-        types = json.load(urllib2.urlopen('http://api.typepad.com/object-types.json'))
+        types = json.load(urllib2.urlopen('http://api.typepad.com/client-library-helpers/object-types.json'))
     else:
         with open(types_fn) as f:
             types = json.load(f)
 
-    if nouns_fn is None:
-        nouns = json.load(urllib2.urlopen('http://api.typepad.com/nouns.json'))
+    if resourcemap_fn is None:
+        rmap = json.load(urllib2.urlopen('http://api.typepad.com/client-library-helpers/resource-mappings.json'))
     else:
-        with open(nouns_fn) as f:
-            nouns = json.load(f)
+        with open(resourcemap_fn) as f:
+            rmap = json.load(f)
 
     objtypes = set()
     objtypes_by_name = dict()
@@ -945,27 +983,21 @@ def generate_types(types_fn=None, nouns_fn=None):
             objtypes_by_name[objtype.name] = objtype
 
     # Annotate the types with endpoint info.
-    for endpoint in nouns['entries']:
-        # Fix up blogs.comments to have a resource type.
-        if endpoint['name'] == 'blogs':
-            for propendp in endpoint['propertyEndpoints']:
-                if propendp.get('name') == 'comments':
-                    propendp['resourceObjectType'] = {
-                        'name': 'List<Comment>',
-                    }
-                    break
-        # Fix up relationships to have a correct object type.
-        elif endpoint['name'] == 'relationships':
-            endpoint['resourceObjectType']['name'] = 'Relationship'
+    for name, mapping in rmap.iteritems():
+        if 'objectType' not in mapping:
+            first_endpoint = mapping['endpoints'][0]
+            logging.warn('Mapping containing %s endpoint at /%s has no object type; skipping them',
+                first_endpoint['endpointType'], '/'.join(str(x) for x in first_endpoint['pathChunks']))
+            continue
 
+        resource_name = mapping['objectType']
         try:
-            resource_name = endpoint['resourceObjectType']['name']
-            logging.debug('Finding object for type %s so it can have endpoint %r', resource_name, objtypes_by_name.get(resource_name))
             objtype = objtypes_by_name[resource_name]
         except KeyError:
-            pass
+            logging.warn('Mapping uses unknown object type %r; skipping some endpoints', resource_name)
         else:
-            objtype.endpoint = endpoint
+            logging.debug('Finding object for type %s so it can have endpoint %r', resource_name, objtypes_by_name.get(resource_name))
+            objtype.endpoints = mapping['endpoints']
 
     return objtypes
 
@@ -1051,7 +1083,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description='generate a TypePad client library from json endpoints')
     parser.add_argument('--types', metavar='file', help='parse file for object type info', default=None)
-    parser.add_argument('--nouns', metavar='file', help='parse file for noun endpoint info', default=None)
+    parser.add_argument('--resourcemap', metavar='file', help='parse file for resource mapping info', default=None)
     parser.add_argument('-v', action=Add, nargs=0, dest='verbose', default=2, help='be more verbose')
     parser.add_argument('-q', action=Subt, nargs=0, dest='verbose', help='be less verbose')
     parser.add_argument('outfile', help='file to write library to')
@@ -1067,7 +1099,7 @@ def main(argv=None):
     logging.basicConfig(level=log_level)
     logging.info('Log level set to %s', logging.getLevelName(log_level))
 
-    objtypes = generate_types(ohyeah.types, ohyeah.nouns)
+    objtypes = generate_types(ohyeah.types, ohyeah.resourcemap)
     if ohyeah.docstrings:
         fn = write_docstrings
     elif ohyeah.docs:

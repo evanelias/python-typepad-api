@@ -30,6 +30,7 @@
 import logging
 
 import simplejson as json
+import urlparse
 
 import remoteobjects.dataobject
 import remoteobjects.fields
@@ -49,6 +50,11 @@ class Link(remoteobjects.fields.Link):
 
     """
 
+    def __init__(self, cls, api_url, is_callable=False, **kwargs):
+        super(Link, self).__init__(cls, **kwargs)
+        self.api_name = self.api_url = api_url
+        self.is_callable = is_callable
+
     def __get__(self, instance, type=None, **kwargs):
         """Generates the `TypePadObject` representing the target of this
         `Link` object.
@@ -60,15 +66,28 @@ class Link(remoteobjects.fields.Link):
         if instance is None:
             return self
 
+        if self.is_callable:
+            self._bound_instance = instance
+            return self
+        else:
+            return self._result(instance, **kwargs)
+
+    def __call__(self, **kwargs):
+        """Subresources that require parameters other than just "id" result in callables, instead of
+        properties.  The caller then passes in the additional params as kwargs in a method call.
+        """
+        return self._result(self._bound_instance, **kwargs)
+
+    def _result(self, instance, **kwargs):
         try:
-            if instance._location is None:
-                raise AttributeError('Cannot find URL of %s relative to URL-less %s' % (type(self).__name__, owner.__name__))
-
-            assert instance._location.endswith('.json')
-            newurl = instance._location[:-5]
-            newurl += '/' + self.api_name
-            newurl += '.json'
-
+            endpoint = _get_endpoint_from_instance(instance)
+            params = _get_params_from_kwargs(prop=self, instance=instance, kwargs_dict=kwargs)
+            try:
+                newurl = endpoint + (self.api_url % params)
+            except KeyError, k:
+                logging.error('This method requires a keyword arg param %s that was not supplied.' % k)
+                raise
+            
             cls = self.cls
             if isinstance(cls, basestring):
                 cls = remoteobjects.dataobject.find_by_name(cls)
@@ -81,8 +100,8 @@ class Link(remoteobjects.fields.Link):
 
 class ActionEndpoint(remoteobjects.fields.Property):
 
-    def __init__(self, api_name, post_type, response_type=None, **kwargs):
-        self.api_name = api_name
+    def __init__(self, api_url, post_type, response_type=None, **kwargs):
+        self.api_name = self.api_url = api_url
         self.post_type = post_type
         self.response_type = response_type
         super(ActionEndpoint, self).__init__(**kwargs)
@@ -94,16 +113,16 @@ class ActionEndpoint(remoteobjects.fields.Property):
             self.api_name = attrname
 
     def __get__(self, instance, owner):
-        if instance._location is None:
-            raise AttributeError('Cannot find URL of %s relative to URL-less %s' % (self.cls.__name__, owner.__name__))
-
-        assert instance._location.endswith('.json')
-        newurl = instance._location[:-5]
-        newurl += '/' + self.api_name
-        newurl += '.json'
-
         def post(**kwargs):
             post_obj = self.post_type(**kwargs)
+
+            endpoint = _get_endpoint_from_instance(instance, default=typepad.client.endpoint)
+            params = _get_params_from_kwargs(prop=self, instance=instance, kwargs_dict=kwargs)
+            try:
+                newurl = endpoint + (self.api_url % params)
+            except KeyError, k:
+                logging.error('This method requires a keyword arg param %s that was not supplied.' % k)
+                raise
 
             body = json.dumps(post_obj.to_dict(), default=remoteobjects.http.omit_nulls)
             headers = {'content-type': post_obj.content_types[0]}
@@ -122,3 +141,32 @@ class ActionEndpoint(remoteobjects.fields.Property):
             return resp_obj
 
         return post
+
+
+def _get_endpoint_from_instance(instance, default=''):
+    """Given an instance of a TypePadObject, return its client endpoint.
+    """
+    if hasattr(instance, '_http') and instance._http and instance._http.endpoint:
+        return instance._http.endpoint
+    elif hasattr(instance, '_location') and instance._location:
+        parts = urlparse.urlparse(instance._location)
+        if parts[0] and parts[1]:
+            return '%s://%s' % (parts[0], parts[1])
+    else:
+        return default
+
+
+def _get_params_from_kwargs(prop, instance, kwargs_dict):
+    """Given a TypePadObject instance, a Link or ActionEndpoint property, and a kwargs dictionary,
+    returns a param list dict intended for URL format specifier replacement.  Relevant params are
+    consumed from kwargs_dict, and the instance's ID is added in automatically too.
+    """
+    params = kwargs_dict.copy()
+    params['id'] = instance.url_id
+
+    # Clean up, by removing the kwargs we consumed in the URL path
+    for kwarg in kwargs_dict.keys():
+        if '%%(%s)s'%kwarg in prop.api_url:
+            del kwargs_dict[kwarg]
+
+    return params
